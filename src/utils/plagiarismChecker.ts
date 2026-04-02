@@ -14,7 +14,7 @@ export const checkPlagiarism = async (
   options = {}
 ) => {
   try {
-    const res = await fetch("http://localhost:5000/check", {
+    const res = await fetch("https://plagiarism-backend-tmp4.onrender.com/check", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
