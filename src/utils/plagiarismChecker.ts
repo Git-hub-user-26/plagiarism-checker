@@ -4,28 +4,22 @@ export interface PlagiarismSource {
   title: string;
   url: string;
   matchPercentage: number;
-  aiConfidence: "high" | "medium" | "low"; // added by AI verification layer
+  aiLabel: "copied" | "paraphrased" | "common_phrase" | "not_plagiarized" | "unknown";
 }
 
 export interface PlagiarismResult {
   plagiarismPercentage: number;
   sources: PlagiarismSource[];
-  cached?: boolean; // true if the result came from backend cache
+  cached?: boolean;
 }
 
-// Point this at your Render backend URL in production
+// VITE_API_URL must be set in your .env and in Vercel environment variables
+// e.g. VITE_API_URL=https://plagiarism-backend-tmp4.onrender.com
 const BACKEND_URL =
   import.meta.env.VITE_API_URL || "http://localhost:5000";
 
-const TIMEOUT_MS = 60_000; // 60s — Render cold starts can be slow
+const TIMEOUT_MS = 60_000; // 60s — accounts for Render cold starts
 
-/**
- * Check text for plagiarism.
- * Includes:
- *  - Request timeout (AbortController)
- *  - One automatic retry on network failure
- *  - Structured error messages for the UI
- */
 export async function checkPlagiarism(
   text: string,
   attempt = 1
@@ -36,14 +30,13 @@ export async function checkPlagiarism(
   try {
     const response = await fetch(`${BACKEND_URL}/check`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },  
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
       signal: controller.signal,
     });
 
     clearTimeout(timeoutId);
 
-    // Handle non-2xx responses with clean error messages
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       const message =
@@ -62,12 +55,10 @@ export async function checkPlagiarism(
   } catch (err: unknown) {
     clearTimeout(timeoutId);
 
-    const isAbort =
-      err instanceof Error && err.name === "AbortError";
-    const isNetwork =
-      err instanceof TypeError && err.message.includes("fetch");
+    const isAbort   = err instanceof Error && err.name === "AbortError";
+    const isNetwork = err instanceof TypeError && err.message.includes("fetch");
 
-    // Retry once on network errors or timeouts (not on validation/server errors)
+    // Retry once on network / timeout errors only
     if ((isAbort || isNetwork) && attempt === 1) {
       console.warn("Request failed, retrying once...");
       return checkPlagiarism(text, 2);
@@ -75,11 +66,10 @@ export async function checkPlagiarism(
 
     if (isAbort) {
       throw new Error(
-        "The request timed out. The server may be starting up — please try again."
+        "The request timed out. The server may be starting up — please try again in 30 seconds."
       );
     }
 
-    // Re-throw structured errors from above, or wrap unknown ones
     if (err instanceof Error) throw err;
     throw new Error("An unexpected error occurred.");
   }
