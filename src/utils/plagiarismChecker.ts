@@ -15,7 +15,7 @@ export interface PlagiarismResult {
 
 // Point this at your Render backend URL in production
 const BACKEND_URL =
-  import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
+  import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 const TIMEOUT_MS = 60_000; // 60s — Render cold starts can be slow
 
@@ -36,7 +36,7 @@ export async function checkPlagiarism(
   try {
     const response = await fetch(`${BACKEND_URL}/check`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },  
       body: JSON.stringify({ text }),
       signal: controller.signal,
     });
