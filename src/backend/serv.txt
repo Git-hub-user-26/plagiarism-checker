@@ -1,0 +1,265 @@
+import natural from "natural";
+import sw from "stopword";
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import axios from "axios";
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ─────────────────────────────────────────────
+// TEST ROUTE
+// ─────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.send("Backend is running");
+});
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+
+const tokenizer = new natural.WordTokenizer();
+
+/**
+ * Preprocess: lowercase → tokenize → remove stopwords → return clean word array
+ */
+function preprocess(text) {
+  const words = tokenizer.tokenize(text.toLowerCase()) || [];
+  return sw.removeStopwords(words);
+}
+
+/**
+ * Split text into overlapping chunks of ~CHUNK_SIZE words.
+ * Overlap helps catch sentences that span chunk boundaries.
+ */
+function chunkText(text, chunkSize = 50, overlap = 10) {
+  const words = text.split(/\s+/);
+  const chunks = [];
+  let i = 0;
+  while (i < words.length) {
+    const chunk = words.slice(i, i + chunkSize).join(" ");
+    if (chunk.trim().length > 0) chunks.push(chunk);
+    i += chunkSize - overlap;
+  }
+  return chunks;
+}
+
+/**
+ * Build a TF-IDF term-frequency map for a given word array.
+ * We keep it simple: term frequency (normalized) — IDF is approximated
+ * by treating both documents together.
+ */
+function buildTFVector(words) {
+  const freq = {};
+  for (const w of words) {
+    freq[w] = (freq[w] || 0) + 1;
+  }
+  // Normalize by total count
+  const total = words.length || 1;
+  for (const w in freq) freq[w] /= total;
+  return freq;
+}
+
+/**
+ * Cosine similarity between two TF vectors (objects).
+ */
+function cosineSimilarity(vecA, vecB) {
+  const allKeys = new Set([...Object.keys(vecA), ...Object.keys(vecB)]);
+  let dot = 0, magA = 0, magB = 0;
+  for (const key of allKeys) {
+    const a = vecA[key] || 0;
+    const b = vecB[key] || 0;
+    dot += a * b;
+    magA += a * a;
+    magB += b * b;
+  }
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+/**
+ * Fetch actual page content from a URL (best-effort).
+ * Strips HTML tags and returns plain text (first ~2000 chars).
+ * Falls back to snippet if fetch fails.
+ */
+async function fetchPageText(url, fallback = "") {
+  try {
+    const response = await axios.get(url, {
+      timeout: 4000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (compatible; PlagiarismChecker/1.0)",
+      },
+      // Only fetch text-based content
+      maxContentLength: 500_000,
+    });
+    const html = response.data || "";
+    // Strip HTML tags
+    const plain = html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return plain.slice(0, 3000); // limit for performance
+  } catch {
+    return fallback; // fallback to snippet
+  }
+}
+
+/**
+ * Given a chunk, find the best matching source from SERP results.
+ * Returns { url, title, similarity }
+ */
+async function getBestMatchForChunk(chunk, serpResults) {
+  const chunkWords = preprocess(chunk);
+  const chunkVec = buildTFVector(chunkWords);
+
+  let best = null;
+
+  for (const item of serpResults) {
+    // Use fetched page content or snippet as fallback
+    const pageText = item._fetchedText || item.snippet || item.title || "";
+    const pageWords = preprocess(pageText);
+    const pageVec = buildTFVector(pageWords);
+
+    const similarity = cosineSimilarity(chunkVec, pageVec);
+
+    if (!best || similarity > best.similarity) {
+      best = {
+        url: item.link,
+        title: item.title,
+        similarity,
+      };
+    }
+  }
+  return best;
+}
+
+// ─────────────────────────────────────────────
+// PLAGIARISM ROUTE
+// ─────────────────────────────────────────────
+
+// Threshold: cosine similarity above this = plagiarized chunk
+const SIMILARITY_THRESHOLD = 0.35;
+
+// How many SERP results to use per query
+const MAX_SERP_RESULTS = 5;
+
+// Max chunks to search (to control SERP API quota usage)
+const MAX_CHUNKS_TO_SEARCH = 6;
+
+app.post("/check", async (req, res) => {
+  const { text } = req.body;
+
+  // ── Input validation ──
+  if (!text || typeof text !== "string" || text.trim().length < 30) {
+    return res.status(400).json({
+      error: "Please provide at least 30 characters of text to check.",
+    });
+  }
+
+  const apiKey = process.env.SERP_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "SERP API key is not configured." });
+  }
+
+  try {
+    // ── Step 1: Split text into chunks ──
+    const chunks = chunkText(text, 50, 10);
+
+    // Limit chunks for API efficiency; pick evenly spaced samples for long docs
+    const step = Math.max(1, Math.floor(chunks.length / MAX_CHUNKS_TO_SEARCH));
+    const selectedChunks = chunks.filter((_, i) => i % step === 0).slice(0, MAX_CHUNKS_TO_SEARCH);
+
+    // ── Step 2: For each chunk, search SERP and fetch page content ──
+    const sourceMap = new Map(); // url → { title, url, bestSimilarity, matchedChunks }
+
+    // Track which chunks are plagiarized
+    let plagiarizedChunkCount = 0;
+
+    for (const chunk of selectedChunks) {
+      // Build a clean query from the chunk
+      const queryWords = preprocess(chunk);
+      const query = queryWords.slice(0, 10).join(" ");
+      if (!query) continue;
+
+      let serpResults = [];
+      try {
+        const serpResponse = await axios.get("https://serpapi.com/search", {
+          params: { q: query, api_key: apiKey, engine: "google" },
+          timeout: 8000,
+        });
+        serpResults = (serpResponse.data.organic_results || []).slice(0, MAX_SERP_RESULTS);
+      } catch {
+        // If one SERP call fails, skip this chunk
+        continue;
+      }
+
+      // ── Step 3: Fetch actual page content for each SERP result ──
+      // (do in parallel for speed)
+      await Promise.all(
+        serpResults.map(async (item) => {
+          if (!item._fetchedText) {
+            item._fetchedText = await fetchPageText(
+              item.link,
+              item.snippet || item.title || ""
+            );
+          }
+        })
+      );
+
+      // ── Step 4: Find best match for this chunk ──
+      const best = await getBestMatchForChunk(chunk, serpResults);
+
+      if (best && best.similarity >= SIMILARITY_THRESHOLD) {
+        plagiarizedChunkCount++;
+
+        // Accumulate per-source stats
+        if (!sourceMap.has(best.url)) {
+          sourceMap.set(best.url, {
+            title: best.title,
+            url: best.url,
+            bestSimilarity: best.similarity,
+            matchedChunks: 1,
+          });
+        } else {
+          const existing = sourceMap.get(best.url);
+          existing.matchedChunks++;
+          existing.bestSimilarity = Math.max(existing.bestSimilarity, best.similarity);
+        }
+      }
+    }
+
+    // ── Step 5: Compute honest plagiarism percentage ──
+    // = (plagiarized chunks / total chunks searched) × 100
+    const plagiarismPercentage =
+      selectedChunks.length > 0
+        ? Math.round((plagiarizedChunkCount / selectedChunks.length) * 100)
+        : 0;
+
+    // ── Step 6: Format sources for response ──
+    const sources = Array.from(sourceMap.values())
+      .sort((a, b) => b.bestSimilarity - a.bestSimilarity)
+      .map((s) => ({
+        title: s.title,
+        url: s.url,
+        matchPercentage: Math.round(s.bestSimilarity * 100),
+      }));
+
+    res.json({ plagiarismPercentage, sources });
+
+  } catch (err) {
+    console.error("Plagiarism check error:", err.message);
+    res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+// ─────────────────────────────────────────────
+app.listen(5000, () => {
+  console.log("Server running on http://localhost:5000");
+});
