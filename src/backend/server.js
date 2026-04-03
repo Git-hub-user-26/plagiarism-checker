@@ -68,9 +68,17 @@ const sources = results.slice(0, 5).map((item) => {
   };
 });
 
-    const plagiarismPercentage = sources.length > 0
-      ? Math.min(80, sources.length * 20)
-      : 0;
+    const validSources = sources.filter(s => s.matchPercentage > 10);
+
+let plagiarismPercentage = 0;
+
+if (validSources.length > 0) {
+  const avg =
+    validSources.reduce((sum, s) => sum + s.matchPercentage, 0) /
+    validSources.length;
+
+  plagiarismPercentage = Math.round(avg);
+}
 
     res.json({
       sources,
